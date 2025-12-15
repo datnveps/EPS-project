@@ -32,7 +32,12 @@ def query(conn, sqlcmd, args=None, df=True):
         print("Error encountered: ", e, sep='\n')
     return result
 def main():
-    response = requests.get('https://10.32.194.4/PIVision/#/')
+    params = {
+        'username': 'VINHTAN02PIAF',
+        'password': 'Rms@vt02idpiaf'
+    }
+    
+    response = requests.get('https://10.156.8.181/PIwebapi/analyses/I1XsDqD5loBNH0erqeqJodtALAWDOFEb-U5xGEQwAVXYTCAA', params=params, verify=False)
     print(response.json())
 
 
