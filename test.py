@@ -145,23 +145,28 @@ def setup():
     # 5. READ DATA (SINGLE STREAM - Example for verification)
     # -----------------------------
     
-def populate_data(all_raw_attribute_webids):
+def populate_data(all_raw_attribute_webids, conn):
     first_path = list(all_raw_attribute_webids.keys())[0]
     attribute_webid = all_raw_attribute_webids[first_path]
 
     print(f"\n--- Reading Recorded Data (10 values) for the first attribute found: {first_path} ---")
+
+    unit=pd.DataFrame(columns=['unit_name'])
+    boiler=pd.DataFrame(columns=['boiler_name','unit_id'])
+    fan=pd.DataFrame(columns=['type','temp','x','y'])
+    motor=pd.DataFrame(columns=['type','temp','x','y'])
+    speed=pd.DataFrame(columns=['speed_feed','VFD_speed'])
+    coil=pd.DataFrame(columns=['u1','u','v1','v','w1','w'])
+    IDF=pd.DataFrame(columns=['boiler_id','fan_id','motor_id','coil_id','time_stamp','speed_id','lub_temp'])
+
 
     for i in range(len(all_raw_attribute_webids)):
         path = list(all_raw_attribute_webids.keys())[i]
         attribute_webid = all_raw_attribute_webids[path]
 
         recorded_data = get(f"/streams/{attribute_webid}/interpolated",
-                                params={"startTime":"*-1y","endTime":"*","interval":"1h"})
-        print(f"/streams/{attribute_webid}/interpolated")
-        # for item in recorded_data["Items"]:
-        #     timestamp = item["Timestamp"]
-        #     value = item["Value"]
-        #     print(f"Path: {path}, Timestamp: {timestamp}, Value: {value}")
+                                params={"startTime":"*-2mo","endTime":"*","interval":"1m"})
+
 
 def create_schema():
     credential_filepath = 'db_credentials.json'
@@ -169,19 +174,64 @@ def create_schema():
 
 
     conn.execute(text("""
-    CREATE TABLE IF NOT EXISTS pi_raw_data (
-        id SERIAL PRIMARY KEY,
-        path VARCHAR(255),
-        webid VARCHAR(255),
-        timestamp TIMESTAMP,
-        value FLOAT
+    CREATE TABLE IF NOT EXISTS unit (
+        unit_id SERIAL PRIMARY KEY,
+        unit_name VARCHAR(50) UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS boiler (
+        boiler_id SERIAL PRIMARY KEY,
+        boiler_name VARCHAR(50) UNIQUE NOT NULL,
+        unit_id INT REFERENCES unit(unit_id)
+    );
+    CREATE TABLE IF NOT EXISTS fan (
+        fan_id SERIAL UNIQUE ,
+        type VARCHAR(50),
+        PRIMARY KEY (fan_id, type),
+        temp FLOAT,
+        x FLOAT,
+        y FLOAT
+    );
+    CREATE TABLE IF NOT EXISTS motor (
+        motor_id SERIAL UNIQUE,
+        type VARCHAR(50),
+        PRIMARY KEY (motor_id, type),
+        temp FLOAT,
+        x FLOAT,
+        y FLOAT
+    );
+    CREATE TABLE IF NOT EXISTS speed (
+        speed_id SERIAL PRIMARY KEY,
+        speed_feed FLOAT,
+        VFD_speed FLOAT
+    );
+    CREATE TABLE IF NOT EXISTS coil (
+        coil_id SERIAL PRIMARY KEY,
+        u1 FLOAT,
+        u FLOAT,
+        v1 FLOAT,
+        v FLOAT,
+        w1 FLOAT,
+        w FLOAT
+    );
+    CREATE TABLE IF NOT EXISTS IDF (
+        idf_id SERIAL PRIMARY KEY,
+        boiler_id INT REFERENCES boiler(boiler_id),
+        fan_id INT REFERENCES fan(fan_id),
+        motor_id INT REFERENCES motor(motor_id),
+        coil_id INT REFERENCES coil(coil_id),
+        time_stamp TIMESTAMP NOT NULL,
+        speed_id INT REFERENCES speed(speed_id),
+        lub_temp FLOAT
     );
     """))
 
+    conn.commit()
+    return conn
+
 def main():
     all_raw_attribute_webids=setup()
-    create_schema()
-    populate_data(all_raw_attribute_webids)
+    conn=create_schema()
+    populate_data(all_raw_attribute_webids, conn)
     
 
 if __name__ == "__main__":
