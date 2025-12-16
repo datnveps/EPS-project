@@ -1,3 +1,4 @@
+#/streams/F1AbEY5NASxI4YUq_ILrgW5Hzzwvq__ASJu7RGFjbR68eTYMQk9S8C_HxAVQ7x6nPOoAewQUk1TLU1EMS1QSUFGXEVBUkxZIFdBUk5JTkcgU1lTVEVNIE1EMVxNRDFcVU5JVCAxXEJPSUxFUiBBXElORFVDRUQgRFJBRlQgRkFOU1xJREYtQXxCT0lMRVIgQk0gT1VU/interpolated
 import json
 import pandas as pd
 import requests
@@ -6,6 +7,7 @@ from sqlalchemy import create_engine, text
 import requests
 import urllib3
 from requests_ntlm import HttpNtlmAuth
+import psycopg2
 
 # ----------------------------------------------------
 # 1. DATABASE UTILITY FUNCTIONS (Provided by User)
@@ -41,49 +43,39 @@ def query(conn, sqlcmd, args=None, df=True):
         print("Error encountered: ", e, sep='\n')
     return result
 
-# ----------------------------------------------------
-# 2. PI WEB API UTILITY FUNCTIONS (Provided & Added)
-# ----------------------------------------------------
-
-
-
-def find_child_element_webid(parent_webid, child_name, get_func):
-    """Fetches the WebId of a specific child element under a given parent."""
-    children = get_func(f"/elements/{parent_webid}/elements")
-    for el in children["Items"]:
-        if el['Name'] == child_name:
-            return el['WebId']
-    return None
-
-
-# ----------------------------------------------------
-# 3. MAIN EXECUTION FUNCTION
-# ----------------------------------------------------
-
-def main():
-    def get(endpoint, params=None):
-        """Helper function to make GET requests to the PI Web API."""
-        url = BASE_URL + endpoint
-        r = session.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
-    
-    # -----------------------------
-    # CONFIGURATION
-    # -----------------------------
-    BASE_URL = "https://10.32.194.4/piwebapi"
+def get(endpoint, params=None):
     USERNAME = "MONGDUONG01PIAF"  
-    PASSWORD = "AccountForReadOnly@MD1"  
-    
-    # === REQUIRED INPUT: SET THE TARGET CATEGORY NAME ===
-    TARGET_CATEGORY_NAME = "Raw"  
-    # ====================================================
+    PASSWORD = "AccountForReadOnly@MD1" 
 
-    # Disable SSL warnings and set up NTLM authentication
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     session = requests.Session()
     session.verify = False
     session.auth = HttpNtlmAuth(USERNAME, PASSWORD)
+
+    BASE_URL = "https://10.32.194.4/piwebapi"
+    """Helper function to make GET requests to the PI Web API."""
+    url = BASE_URL + endpoint
+    r = session.get(url, params=params)
+    r.raise_for_status()
+    return r.json()
+
+# ----------------------------------------------------
+# 2. PI WEB API INTERACTION
+# ----------------------------------------------------
+def setup():
+    def find_child_element_webid(parent_webid, child_name, get_func):
+        """Fetches the WebId of a specific child element under a given parent."""
+        children = get_func(f"/elements/{parent_webid}/elements")
+        for el in children["Items"]:
+            if el['Name'] == child_name:
+                return el['WebId']
+        return None
+    
+    
+
+    # === REQUIRED INPUT: SET THE TARGET CATEGORY NAME ===
+    TARGET_CATEGORY_NAME = "Raw"  
+    # ====================================================
 
     # -----------------------------
     # 1 & 2. ASSET SERVER & DATABASE
@@ -98,13 +90,10 @@ def main():
     print(f"Target DB: {db_name}, WebId: {early_warning_system_id}")
 
     # -----------------------------
-    # 3. ROOT ELEMENTS (Two levels: MD1 -> Element1)
+    # 3. ROOT ELEMENTS (Two levels: MD1 )
     # -----------------------------
-    # Step 3a: Find the 'MD1' element at the root of the database
     root_element_webid = get(f"/assetdatabases/{early_warning_system_id}/elements?name=MD1")["Items"][1]["WebId"]
-    root_element_name = get(f"/elements/{root_element_webid}")["Name"]
-    print(f"Root Element {root_element_name} WebId: {root_element_webid}")
-    
+
 
 
     # -----------------------------
@@ -148,31 +137,52 @@ def main():
                 for attr_name, attr_webid in raw_attributes.items():
                     # Update path to include the new MD1 level
                     path = f"MD1|{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
-                    print(f"Found: {path}")
                     all_raw_attribute_webids[path] = attr_webid
-                    # print(f"Found: {path}") # Uncomment to see all IDs found
+                
+                return all_raw_attribute_webids
 
     # -----------------------------
-    # 5. READ DATA (BULK CURRENT VALUE) - Highly Recommended
+    # 5. READ DATA (SINGLE STREAM - Example for verification)
     # -----------------------------
-    #
-    # -----------------------------
-    # 6. READ DATA (SINGLE STREAM - Example for verification)
-    # -----------------------------
+    
+def populate_data(all_raw_attribute_webids):
     first_path = list(all_raw_attribute_webids.keys())[0]
     attribute_webid = all_raw_attribute_webids[first_path]
 
     print(f"\n--- Reading Recorded Data (10 values) for the first attribute found: {first_path} ---")
 
-    recorded = get(f"/streams/{attribute_webid}/recorded", params={
-        "startTime": "*-1h",
-        "endTime": "*",
-        "maxCount": 10
-    })
+    for i in range(len(all_raw_attribute_webids)):
+        path = list(all_raw_attribute_webids.keys())[i]
+        attribute_webid = all_raw_attribute_webids[path]
 
-    print("\nRecorded Values (last 1 hour, max 10 values):")
-    for item in recorded["Items"]:
-        print(item["Timestamp"], "=", item["Value"])
+        recorded_data = get(f"/streams/{attribute_webid}/interpolated",
+                                params={"startTime":"*-1y","endTime":"*","interval":"1h"})
+        print(f"/streams/{attribute_webid}/interpolated")
+        # for item in recorded_data["Items"]:
+        #     timestamp = item["Timestamp"]
+        #     value = item["Value"]
+        #     print(f"Path: {path}, Timestamp: {timestamp}, Value: {value}")
+
+def create_schema():
+    credential_filepath = 'db_credentials.json'
+    db, conn = pgconnect(credential_filepath, db_schema="public")
+
+
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS pi_raw_data (
+        id SERIAL PRIMARY KEY,
+        path VARCHAR(255),
+        webid VARCHAR(255),
+        timestamp TIMESTAMP,
+        value FLOAT
+    );
+    """))
+
+def main():
+    all_raw_attribute_webids=setup()
+    create_schema()
+    populate_data(all_raw_attribute_webids)
+    
 
 if __name__ == "__main__":
     main()
