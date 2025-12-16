@@ -9,7 +9,6 @@ from requests_ntlm import HttpNtlmAuth
 
 # ----------------------------------------------------
 # 1. DATABASE UTILITY FUNCTIONS (Provided by User)
-#    - Not used for the PI Web API part, but kept for completeness.
 # ----------------------------------------------------
 
 def pgconnect(credential_filepath, db_schema="public"):
@@ -129,17 +128,28 @@ def main():
     asset_server_webid = asset_servers["Items"][0]["WebId"]
     databases = get(f"/assetservers/{asset_server_webid}/assetdatabases")
     # Using index 5 as specified in your original code
-    early_warning_system_id = databases["Items"][5]["WebId"] 
-    db_name = databases["Items"][5]["Name"]
+    early_warning_system_db_item = databases["Items"][5]
+    early_warning_system_id = early_warning_system_db_item["WebId"] 
+    db_name = early_warning_system_db_item["Name"]
     print(f"Target DB: {db_name}, WebId: {early_warning_system_id}")
 
     # -----------------------------
-    # 3. ROOT ELEMENT: Element1
+    # 3. ROOT ELEMENTS (Two levels: MD1 -> Element1)
     # -----------------------------
-    root_element_webid = find_element_webid(early_warning_system_id, "MD1", get)
-    if not root_element_webid:
-        print("Error: Could not find root element 'Element1'.")
+    # Step 3a: Find the 'MD1' element at the root of the database
+    md1_element_webid = find_element_webid(early_warning_system_id, "MD1", get)
+    if not md1_element_webid:
+        print("Error: Could not find element 'MD1' at the root of the database.")
         return
+    print(f"MD1 Element WebId: {md1_element_webid}")
+    
+    # Step 3b: Find 'Element1' under 'MD1' (as per your image)
+    root_element_webid = find_child_element_webid(md1_element_webid, "Element1", get)
+    if not root_element_webid:
+        print("Error: Could not find element 'Element1' under 'MD1'.")
+        return
+    print(f"Element1 WebId: {root_element_webid}")
+
 
     # -----------------------------
     # 4. ITERATE AND COLLECT ATTRIBUTE WEBIDS
@@ -147,11 +157,10 @@ def main():
     # Define the structure based on the image
     target_elements = {
         "Unit 1": ["Boiler A", "Boiler B"],
-        "Unit 2": ["Boiler A", "Boiler B"], 
+        "Unit 2": ["Boiler A"] 
     }
     fan_names = ["IDF-A", "IDF-B"]
     
-    # Dictionary to store {Full_Path: WebId} for ALL found attributes
     all_raw_attribute_webids = {} 
 
     print(f"\nSearching for ALL attributes with category '{TARGET_CATEGORY_NAME}'...")
@@ -180,9 +189,10 @@ def main():
                 
                 # Store the found attributes
                 for attr_name, attr_webid in raw_attributes.items():
-                    path = f"{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
+                    # Update path to include the new MD1 level
+                    path = f"MD1|Element1|{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
                     all_raw_attribute_webids[path] = attr_webid
-                    print(f"Found: {path}")
+                    # print(f"Found: {path}") # Uncomment to see all IDs found
 
     # -----------------------------
     # 5. READ DATA (BULK CURRENT VALUE) - Highly Recommended
@@ -199,7 +209,6 @@ def main():
     
     print(f"\n--- Reading Current Value for {total_attributes} Attributes (Bulk Read) ---")
     
-    # Note: For many webids (over 100), a POST request is better, but GET is fine for smaller lists.
     bulk_url = BASE_URL + "/streams/value?" + "&".join(webid_params)
     r = session.get(bulk_url)
     r.raise_for_status()
@@ -221,7 +230,24 @@ def main():
         else:
              status = value_item.get('Good', False) and 'Good' or 'Bad'
              print(f"  Status: {status}, Error: {value_item.get('Errors', 'N/A')}")
+    
+    # -----------------------------
+    # 6. READ DATA (SINGLE STREAM - Example for verification)
+    # -----------------------------
+    first_path = list(all_raw_attribute_webids.keys())[0]
+    attribute_webid = all_raw_attribute_webids[first_path]
 
+    print(f"\n--- Reading Recorded Data (10 values) for the first attribute found: {first_path} ---")
+
+    recorded = get(f"/streams/{attribute_webid}/recorded", params={
+        "startTime": "*-1h",
+        "endTime": "*",
+        "maxCount": 10
+    })
+
+    print("\nRecorded Values (last 1 hour, max 10 values):")
+    for item in recorded["Items"]:
+        print(item["Timestamp"], "=", item["Value"])
 
 if __name__ == "__main__":
     main()
