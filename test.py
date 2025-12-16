@@ -45,27 +45,7 @@ def query(conn, sqlcmd, args=None, df=True):
 # 2. PI WEB API UTILITY FUNCTIONS (Provided & Added)
 # ----------------------------------------------------
 
-def find_element_webid(database_webid, element_name, get_func):
-    """Searches for an element at the root level of a database by name."""
-    elements = []
-    start_index = 0
-    max_count = 100
-    while True:
-        batch = get_func("/elements", params={
-            "databaseWebId": database_webid,
-            "startIndex": start_index,
-            "maxCount": max_count
-        })
-        if not batch["Items"]:
-            break
-        elements.extend(batch["Items"])
-        start_index += len(batch["Items"])
-        if len(batch["Items"]) < max_count:
-            break
-    for el in elements:
-        if el['Name'] == element_name:
-            return el['WebId']
-    return None
+
 
 def find_child_element_webid(parent_webid, child_name, get_func):
     """Fetches the WebId of a specific child element under a given parent."""
@@ -75,22 +55,6 @@ def find_child_element_webid(parent_webid, child_name, get_func):
             return el['WebId']
     return None
 
-def find_attributes_by_category(element_webid, category_name, get_func):
-    """
-    Fetches all attributes under a given element that belong to the specified category.
-    Returns a dictionary of {AttributeName: WebId}.
-    """
-    found_attributes = {}
-    
-    # Use the CategoryName query parameter to filter attributes directly from the API
-    attributes = get_func(f"/elements/{element_webid}/attributes", params={
-        "CategoryName": category_name
-    })
-    
-    for attr in attributes["Items"]:
-        found_attributes[attr['Name']] = attr['WebId']
-        
-    return found_attributes
 
 # ----------------------------------------------------
 # 3. MAIN EXECUTION FUNCTION
@@ -137,18 +101,10 @@ def main():
     # 3. ROOT ELEMENTS (Two levels: MD1 -> Element1)
     # -----------------------------
     # Step 3a: Find the 'MD1' element at the root of the database
-    md1_element_webid = find_element_webid(early_warning_system_id, "MD1", get)
-    if not md1_element_webid:
-        print("Error: Could not find element 'MD1' at the root of the database.")
-        return
-    print(f"MD1 Element WebId: {md1_element_webid}")
+    root_element_webid = get(f"/assetdatabases/{early_warning_system_id}/elements?name=MD1")["Items"][1]["WebId"]
+    root_element_name = get(f"/elements/{root_element_webid}")["Name"]
+    print(f"Root Element {root_element_name} WebId: {root_element_webid}")
     
-    # Step 3b: Find 'Element1' under 'MD1' (as per your image)
-    root_element_webid = find_child_element_webid(md1_element_webid, "Element1", get)
-    if not root_element_webid:
-        print("Error: Could not find element 'Element1' under 'MD1'.")
-        return
-    print(f"Element1 WebId: {root_element_webid}")
 
 
     # -----------------------------
@@ -157,7 +113,7 @@ def main():
     # Define the structure based on the image
     target_elements = {
         "Unit 1": ["Boiler A", "Boiler B"],
-        "Unit 2": ["Boiler A"] 
+        "Unit 2": ["Boiler A", "Boiler B"], 
     }
     fan_names = ["IDF-A", "IDF-B"]
     
@@ -185,52 +141,21 @@ def main():
                 if not fan_webid: continue
 
                 # Step: Find ALL Raw Attributes
-                raw_attributes = find_attributes_by_category(fan_webid, TARGET_CATEGORY_NAME, get)
+                raw_attributes = get(f"/elements/{fan_webid}/attributes?categoryName={TARGET_CATEGORY_NAME}")
+                raw_attributes = {attr['Name']: attr['WebId'] for attr in raw_attributes["Items"]}
                 
                 # Store the found attributes
                 for attr_name, attr_webid in raw_attributes.items():
                     # Update path to include the new MD1 level
-                    path = f"MD1|Element1|{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
+                    path = f"MD1|{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
+                    print(f"Found: {path}")
                     all_raw_attribute_webids[path] = attr_webid
                     # print(f"Found: {path}") # Uncomment to see all IDs found
 
     # -----------------------------
     # 5. READ DATA (BULK CURRENT VALUE) - Highly Recommended
     # -----------------------------
-    total_attributes = len(all_raw_attribute_webids)
-    if total_attributes == 0:
-        print(f"\nNo attributes with category '{TARGET_CATEGORY_NAME}' were found. Exiting.")
-        return
-        
-    webids_list = list(all_raw_attribute_webids.values())
-    
-    # PI Web API supports a list of 'webid' query parameters for bulk reading
-    webid_params = [f"webid={wid}" for wid in webids_list]
-    
-    print(f"\n--- Reading Current Value for {total_attributes} Attributes (Bulk Read) ---")
-    
-    bulk_url = BASE_URL + "/streams/value?" + "&".join(webid_params)
-    r = session.get(bulk_url)
-    r.raise_for_status()
-    bulk_results = r.json()
-
-    # Organize and print results
-    print("\nBulk Read Current Values:")
-    print("-" * 50)
-    for item in bulk_results["Items"]:
-        # Find the path corresponding to the WebId
-        webid = item["WebId"]
-        path = next((k for k, v in all_raw_attribute_webids.items() if v == webid), "Unknown Path")
-        
-        value_item = item["Value"]
-        
-        print(f"Path: {path}")
-        if 'Value' in value_item:
-             print(f"  Timestamp: {value_item['Timestamp']}, Value: {value_item['Value']}")
-        else:
-             status = value_item.get('Good', False) and 'Good' or 'Bad'
-             print(f"  Status: {status}, Error: {value_item.get('Errors', 'N/A')}")
-    
+    #
     # -----------------------------
     # 6. READ DATA (SINGLE STREAM - Example for verification)
     # -----------------------------
