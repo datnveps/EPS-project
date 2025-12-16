@@ -8,7 +8,7 @@ import requests
 import urllib3
 from requests_ntlm import HttpNtlmAuth
 import psycopg2
-
+import sqlalchemy.types as types
 # ----------------------------------------------------
 # 1. DATABASE UTILITY FUNCTIONS (Provided by User)
 # ----------------------------------------------------
@@ -145,27 +145,216 @@ def setup():
     # 5. READ DATA (SINGLE STREAM - Example for verification)
     # -----------------------------
     
-def populate_data(all_raw_attribute_webids, conn):
-    first_path = list(all_raw_attribute_webids.keys())[0]
-    attribute_webid = all_raw_attribute_webids[first_path]
+def populate_data(all_raw_attribute_webids, db_engine):
+    if not all_raw_attribute_webids:
+        print("No attributes found to process.")
+        return
 
-    print(f"\n--- Reading Recorded Data (10 values) for the first attribute found: {first_path} ---")
+    # --- Step 1: Attribute to Schema Mapping (Crucial Step - Define this clearly) ---
+    # This dictionary maps the PI Attribute name to the final target column (table.column)
+    # NOTE: You MUST verify and complete this mapping based on your 28+ attribute names.
+    ATTRIBUTE_MAPPING = {
+        'FAN_BEARING_TEMP': 'fan.temp',
+        'FAN_VIB_X': 'fan.x',
+        'FAN_VIB_Y': 'fan.y',
+        'MOTOR_BEARING_TEMP': 'motor.temp',
+        'MOTOR_VIB_X': 'motor.x',
+        'MOTOR_VIB_Y': 'motor.y',
+        'BOILER_DEMAND_BIAS': 'IDF.lub_temp', # Assuming lub_temp is a proxy column for a demand value
+        'SPEED_FEEDBACK_RPM': 'speed.speed_feed',
+        'VFD_SPEED_COMMAND': 'speed.VFD_speed',
+        'COIL_U1_VOLTAGE': 'coil.u1',
+        'COIL_U_CURRENT': 'coil.u',
+        'COIL_V1_VOLTAGE': 'coil.v1',
+        'COIL_V_CURRENT': 'coil.v',
+        'COIL_W1_VOLTAGE': 'coil.w1',
+        'COIL_W_CURRENT': 'coil.w',
+        # Add all 28+ attributes here
+    }
 
-    unit=pd.DataFrame(columns=['unit_name'])
-    boiler=pd.DataFrame(columns=['boiler_name','unit_id'])
-    fan=pd.DataFrame(columns=['type','temp','x','y'])
-    motor=pd.DataFrame(columns=['type','temp','x','y'])
-    speed=pd.DataFrame(columns=['speed_feed','VFD_speed'])
-    coil=pd.DataFrame(columns=['u1','u','v1','v','w1','w'])
-    IDF=pd.DataFrame(columns=['boiler_id','fan_id','motor_id','coil_id','time_stamp','speed_id','lub_temp'])
+    # --- Step 2: Fetch all Time-Series Data ---
+    webids_list = list(all_raw_attribute_webids.values())
+    
+    # Batch the requests to avoid URL length limit, max 100 WebIds per call
+    MAX_BATCH_SIZE = 50 
+    all_ts_data = []
+
+    print("\n--- Fetching Interpolated Data (1-minute intervals for 2 months) ---")
+    for i in range(0, len(webids_list), MAX_BATCH_SIZE):
+        batch_webids = webids_list[i:i + MAX_BATCH_SIZE]
+        webid_params = [f"webid={wid}" for wid in batch_webids]
+
+        bulk_url = "/streams/interpolated?" + "&".join(webid_params)
+        
+        recorded = get(bulk_url, params={
+            "startTime": "*-2mo",
+            "endTime": "*",
+            "interval": "1m"
+        })
+        
+        # Structure the data into a flat list of dictionaries
+        for item in recorded["Items"]:
+            webid = item["WebId"]
+            
+            # Map WebId back to path to get hierarchy
+            path = next(k for k, v in all_raw_attribute_webids.items() if v == webid)
+            parts = path.split('|')
+            attr_name = parts[-1]
+            unit_name = parts[1]
+            boiler_name = parts[2]
+            fan_name = parts[4]
+
+            for value_item in item["Items"]:
+                if value_item.get('Good'):
+                    all_ts_data.append({
+                        'timestamp': pd.to_datetime(value_item['Timestamp'], utc=True),
+                        'value': pd.to_numeric(value_item['Value'], errors='coerce'),
+                        'attribute_name': attr_name,
+                        'unit_name': unit_name,
+                        'boiler_name': boiler_name,
+                        'fan_name': fan_name,
+                        'webid': webid # Used for debugging/mapping
+                    })
+
+    if not all_ts_data:
+        print("No valid time series data retrieved.")
+        return
+
+    df_ts = pd.DataFrame(all_ts_data).dropna(subset=['value'])
+    print(f"Total time-series records fetched: {len(df_ts)}")
+
+    # Pivot the data so that each row represents one time slice and contains all component values
+    df_pivot = df_ts.pivot_table(
+        index=['timestamp', 'unit_name', 'boiler_name', 'fan_name'],
+        columns='attribute_name',
+        values='value'
+    ).reset_index()
+
+    # --- Step 3: Insert Static/Unique Dimensions (unit, boiler) ---
+    with db_engine.connect() as conn:
+        conn.execution_options(autocommit=True)
+
+        # 3a. UNIT Table Insertion
+        unit_data = df_pivot[['unit_name']].drop_duplicates()
+        print("\nInserting/Updating Unit Dimension...")
+        for _, row in unit_data.iterrows():
+            # Check if exists, insert if not, return ID
+            sql = text("""
+                INSERT INTO unit (unit_name) VALUES (:unit_name)
+                ON CONFLICT (unit_name) DO UPDATE SET unit_name=EXCLUDED.unit_name -- Dummy update to return ID
+                RETURNING unit_id;
+            """)
+            result = conn.execute(sql, {'unit_name': row['unit_name']}).fetchone()
+            row['unit_id'] = result[0]
+        
+        # 3b. BOILER Table Insertion
+        boiler_data = df_pivot[['unit_name', 'boiler_name']].drop_duplicates()
+        print("Inserting/Updating Boiler Dimension...")
+        
+        # Join boiler_data with the unit_id obtained above
+        boiler_data = pd.merge(boiler_data, unit_data, on='unit_name', how='left')
+
+        for _, row in boiler_data.iterrows():
+            sql = text("""
+                INSERT INTO boiler (boiler_name, unit_id) VALUES (:boiler_name, :unit_id)
+                ON CONFLICT (boiler_name) DO NOTHING -- Assuming boiler_name is unique/used as unique identifier
+                RETURNING boiler_id;
+            """)
+            try:
+                result = conn.execute(sql, {'boiler_name': row['boiler_name'], 'unit_id': row['unit_id']}).fetchone()
+                row['boiler_id'] = result[0] if result else query(conn, "SELECT boiler_id FROM boiler WHERE boiler_name = :boiler_name", {'boiler_name': row['boiler_name']}, df=False)
+            except Exception as e:
+                # Handle cases where the row already existed and RETURNING failed on CONFLICT DO NOTHING
+                print(f"Warning: Conflict on boiler {row['boiler_name']}. Retrieving existing ID.")
+                row['boiler_id'] = query(conn, "SELECT boiler_id FROM boiler WHERE boiler_name = :boiler_name", {'boiler_name': row['boiler_name']}, df=False)
 
 
-    for i in range(len(all_raw_attribute_webids)):
-        path = list(all_raw_attribute_webids.keys())[i]
-        attribute_webid = all_raw_attribute_webids[path]
+    # --- Step 4: Prepare DataFrames for Component Tables (fan, motor, speed, coil) ---
+    # Merge the unit/boiler IDs back into the pivot table
+    df_pivot = pd.merge(df_pivot, unit_data[['unit_name', 'unit_id']], on='unit_name', how='left')
+    df_pivot = pd.merge(df_pivot, boiler_data[['boiler_name', 'boiler_id']], on='boiler_name', how='left')
 
-        recorded_data = get(f"/streams/{attribute_webid}/interpolated",
-                                params={"startTime":"*-2mo","endTime":"*","interval":"1m"})
+    # Prepare component dataframes (one row per fan/motor configuration, not per timestamp)
+    
+    # 4a. FAN Component (assuming type is the fan_name)
+    df_fan = df_pivot.rename(columns={'FAN_BEARING_TEMP': 'temp', 'FAN_VIB_X': 'x', 'FAN_VIB_Y': 'y'})[['fan_name', 'temp', 'x', 'y']].drop_duplicates()
+    df_fan = df_fan.rename(columns={'fan_name': 'type'})
+    
+    # 4b. MOTOR Component
+    df_motor = df_pivot.rename(columns={'MOTOR_BEARING_TEMP': 'temp', 'MOTOR_VIB_X': 'x', 'MOTOR_VIB_Y': 'y'})[['fan_name', 'temp', 'x', 'y']].drop_duplicates()
+    df_motor = df_motor.rename(columns={'fan_name': 'type'})
+
+    # 4c. SPEED Component
+    df_speed = df_pivot.rename(columns={'SPEED_FEEDBACK_RPM': 'speed_feed', 'VFD_SPEED_COMMAND': 'VFD_speed'})[['speed_feed', 'VFD_speed', 'timestamp']].drop_duplicates(subset=['timestamp']) # Speed is time-series
+
+    # 4d. COIL Component
+    df_coil = df_pivot.rename(columns={
+        'COIL_U1_VOLTAGE': 'u1', 'COIL_U_CURRENT': 'u', 
+        'COIL_V1_VOLTAGE': 'v1', 'COIL_V_CURRENT': 'v', 
+        'COIL_W1_VOLTAGE': 'w1', 'COIL_W_CURRENT': 'w'
+    })[['u1', 'u', 'v1', 'v', 'w1', 'w', 'timestamp']].drop_duplicates(subset=['timestamp']) # Coil is time-series
+
+    # --- Step 5: Insert Time-Series Dimensions (speed, coil) ---
+    print("\nInserting Speed and Coil Time-Series Data...")
+    
+    # 5a. SPEED Insertion (Insert and Retrieve IDs)
+    df_speed.to_sql('speed', db_engine, if_exists='append', index=False, method='multi')
+    # Retrieve the generated IDs (This is difficult without a known unique key other than time)
+    # Simplified approach: Reload the data with IDs, matching on timestamp and value (risky, but standard for this schema type)
+    df_speed_ids = query(db_engine, "SELECT speed_id, speed_feed, VFD_speed FROM speed")
+    df_speed_with_ids = pd.merge(df_pivot, df_speed_ids, on=['speed_feed', 'VFD_speed'], how='left')
+    
+    # 5b. COIL Insertion (Insert and Retrieve IDs)
+    df_coil.to_sql('coil', db_engine, if_exists='append', index=False, method='multi')
+    df_coil_ids = query(db_engine, "SELECT coil_id, u1, u, v1, v, w1, w FROM coil")
+    df_coil_with_ids = pd.merge(df_speed_with_ids, df_coil_ids, on=['u1', 'u', 'v1', 'v', 'w1', 'w'], how='left')
+
+    # --- Step 6: Final Fact Table Preparation (IDF) ---
+    
+    # Insert FAN/MOTOR configurations (assuming only a few unique static configs)
+    # The current schema forces FAN/MOTOR to be time-series, which is unusual. 
+    # Sticking to the schema: insert unique configurations and retrieve their IDs.
+
+    # 6a. FAN Insertion
+    df_fan.to_sql('fan', db_engine, if_exists='append', index=False, method='multi')
+    df_fan_ids = query(db_engine, "SELECT fan_id, type, temp, x, y FROM fan")
+    df_fan_final = pd.merge(df_coil_with_ids, df_fan_ids, on=['type', 'temp', 'x', 'y'], how='left')
+
+    # 6b. MOTOR Insertion
+    df_motor.to_sql('motor', db_engine, if_exists='append', index=False, method='multi')
+    df_motor_ids = query(db_engine, "SELECT motor_id, type, temp, x, y FROM motor")
+    df_motor_final = pd.merge(df_fan_final, df_motor_ids, on=['type', 'temp', 'x', 'y'], how='left')
+
+
+    # 6c. Final IDF Fact Table DataFrame
+    df_idf_fact = df_motor_final.rename(columns={'BOILER_DEMAND_BIAS': 'lub_temp', 'timestamp': 'time_stamp'})[[
+        'boiler_id', 'fan_id', 'motor_id', 'coil_id', 'time_stamp', 'speed_id', 'lub_temp'
+    ]]
+
+    # --- Step 7: Insert into Final Fact Table (IDF) ---
+    print("\nInserting into final IDF Fact Table...")
+    
+    # Specify dtypes to prevent insertion errors with float/numeric columns
+    idf_dtypes = {
+        'boiler_id': types.Integer,
+        'fan_id': types.Integer,
+        'motor_id': types.Integer,
+        'coil_id': types.Integer,
+        'time_stamp': types.DateTime,
+        'speed_id': types.Integer,
+        'lub_temp': types.Float, # Use Float for SQL to handle pandas float64
+    }
+
+    df_idf_fact.to_sql(
+        'idf', 
+        db_engine, 
+        if_exists='append', 
+        index=False, 
+        method='multi',
+        chunksize=5000,
+        dtype=idf_dtypes
+    )
+    print(f"Successfully inserted {len(df_idf_fact)} rows into the IDF fact table.")
 
 
 def create_schema():
