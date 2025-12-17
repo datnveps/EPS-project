@@ -1,5 +1,8 @@
 #/streams/F1AbEY5NASxI4YUq_ILrgW5Hzzwvq__ASJu7RGFjbR68eTYMQpcYk37CRIVsiRtJGazqZHAUk1TLU1EMS1QSUFGXEVBUkxZIFdBUk5JTkcgU1lTVEVNIE1EMVxNRDFcVU5JVCAxXEJPSUxFUiBBXElORFVDRUQgRFJBRlQgRkFOU1xJREYtQXxCT0lMRVIgREVNQU5EIEJJQVM/interpolated
 import json
+import os
+import difflib
+from datetime import datetime
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -9,6 +12,9 @@ import urllib3
 from requests_ntlm import HttpNtlmAuth
 import psycopg2
 import sqlalchemy.types as types
+
+# PI Web API base URL (shared)
+BASE_URL = "https://10.32.194.4/piwebapi"
 # ----------------------------------------------------
 # 1. DATABASE UTILITY FUNCTIONS (Provided by User)
 # ----------------------------------------------------
@@ -52,12 +58,158 @@ def get(endpoint, params=None):
     session.verify = False
     session.auth = HttpNtlmAuth(USERNAME, PASSWORD)
 
-    BASE_URL = "https://10.32.194.4/piwebapi"
     """Helper function to make GET requests to the PI Web API."""
     url = BASE_URL + endpoint
     r = session.get(url, params=params)
     r.raise_for_status()
     return r.json()
+
+
+def patch(endpoint, json_body=None):
+    """Helper to send PATCH requests to the PI Web API using NTLM auth."""
+    USERNAME = "MONGDUONG01PIAF"
+    PASSWORD = "AccountForReadOnly@MD1"
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    session = requests.Session()
+    session.verify = False
+    session.auth = HttpNtlmAuth(USERNAME, PASSWORD)
+
+    url = BASE_URL + endpoint
+    r = session.patch(url, json=json_body)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        return {'status_code': r.status_code, 'text': r.text}
+
+
+def update_analysis_rule_config(rule_webid, new_config_string, dry_run=True, backup=True, backup_file='analysisrule_backups.json'):
+    """Update the ConfigString of an analysis rule.
+
+    - dry_run=True: only fetch and show diff, do not PATCH.
+    - backup=True: save old ConfigString to `backup_file` before patching.
+    """
+    # Fetch existing rule
+    rule = get(f"/analysisrules/{rule_webid}")
+    old_config = rule.get('ConfigString', '')
+
+    print(f"AnalysisRule WebId: {rule_webid}")
+    print("--- Old ConfigString ---")
+    print(old_config)
+    print("--- New ConfigString ---")
+    print(new_config_string)
+
+    # Show unified diff
+    old_lines = (old_config or '').splitlines(keepends=True)
+    new_lines = (new_config_string or '').splitlines(keepends=True)
+    diff = ''.join(difflib.unified_diff(old_lines, new_lines, fromfile='old', tofile='new'))
+    if diff:
+        print("--- Diff ---")
+        print(diff)
+    else:
+        print("No changes detected between old and new ConfigString.")
+
+    if dry_run:
+        print("Dry-run enabled — no change will be applied.")
+        return {'status': 'dry_run', 'diff': diff}
+
+    # Backup old config if requested
+    if backup:
+        entry = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'webid': rule_webid,
+            'old_config': old_config,
+            'new_config': new_config_string
+        }
+        try:
+            if os.path.exists(backup_file):
+                with open(backup_file, 'r', encoding='utf-8') as bf:
+                    data = json.load(bf)
+            else:
+                data = []
+        except Exception:
+            data = []
+        data.append(entry)
+        with open(backup_file, 'w', encoding='utf-8') as bf:
+            json.dump(data, bf, indent=2, ensure_ascii=False)
+        print(f"Backup written to {backup_file}")
+
+    # Perform PATCH
+    payload = {'ConfigString': new_config_string}
+    resp = patch(f"/analysisrules/{rule_webid}", json_body=payload)
+    print("Patch response:", resp)
+    return {'status': 'patched', 'response': resp}
+
+
+def find_analysis_rule_webids(rule_name, scope_webid=None, exact=True, return_all=False, max_results=10, include_fields=None):
+    """Find analysis rule WebIds by name.
+
+    - rule_name: exact name or substring to search for.
+    - scope_webid: if provided, search under the element's analyses (`/elements/{webid}/analyses`).
+    - exact: True for exact match, False for substring match.
+    - return_all: if True returns up to `max_results`; if False returns early when limit reached.
+    - include_fields: optional list of fields to fetch per matched rule (e.g. ['ConfigString']).
+
+    Returns a list of dicts: [{'WebId':..., 'Name':..., 'Description':..., ...}, ...]
+    """
+    results = []
+
+    if scope_webid:
+        try:
+            resp = get(f"/elements/{scope_webid}/analyses")
+            items = resp.get('Items', [])
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch analyses for scope {scope_webid}: {e}")
+
+        for it in items:
+            name = it.get('Name', '')
+            match = (name == rule_name) if exact else (rule_name in name)
+            if match:
+                results.append({'WebId': it.get('WebId'), 'Name': name, 'Description': it.get('Description', None)})
+                if not return_all and len(results) >= max_results:
+                    break
+    else:
+        # Try server-side search first, fallback to listing all
+        items = []
+        try:
+            resp = get(f"/analysisrules?search={rule_name}")
+            items = resp.get('Items', [])
+        except Exception:
+            try:
+                resp = get('/analysisrules')
+                items = resp.get('Items', [])
+            except Exception as e:
+                raise RuntimeError(f"Failed to list analysis rules: {e}")
+
+        for it in items:
+            name = it.get('Name', '')
+            match = (name == rule_name) if exact else (rule_name in name)
+            if match:
+                results.append({'WebId': it.get('WebId'), 'Name': name, 'Description': it.get('Description', None)})
+                if not return_all and len(results) >= max_results:
+                    break
+
+    # Optionally fetch extra fields for each matched rule
+    if include_fields and results:
+        for r in results:
+            try:
+                details = get(f"/analysisrules/{r['WebId']}")
+                for fld in include_fields:
+                    r[fld] = details.get(fld)
+            except Exception:
+                r.update({fld: None for fld in include_fields})
+
+    return results
+
+
+def get_analysis_rule_config(rule_webid):
+    """Return the ConfigString for the analysis rule identified by rule_webid."""
+    try:
+        details = get(f"/analysisrules/{rule_webid}")
+        return details.get('ConfigString')
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch analysis rule {rule_webid}: {e}")
 
 # ----------------------------------------------------
 # 2. PI WEB API INTERACTION
@@ -131,15 +283,24 @@ def setup():
 
                 # Step: Find ALL Raw Attributes
                 raw_attributes = get(f"/elements/{fan_webid}/attributes?categoryName={TARGET_CATEGORY_NAME}")
-                raw_attributes = {attr['Name']: attr['WebId'] for attr in raw_attributes["Items"]}
-                
-                # Store the found attributes
-                for attr_name, attr_webid in raw_attributes.items():
-                    # Update path to include the new MD1 level
+                # Store both WebId and the attribute Id (if provided by API)
+                raw_attributes = {
+                    attr['Name']: {
+                        'WebId': attr.get('WebId'),
+                        'Id': attr.get('Id')
+                    }
+                    for attr in raw_attributes["Items"]
+                }
+
+                # Store the found attributes with full path keys
+                for attr_name, attr_info in raw_attributes.items():
                     path = f"MD1|{unit_name}|{boiler_name}|Induced Draft Fans|{fan_name}|{attr_name}"
-                    all_raw_attribute_webids[path] = attr_webid
+                    all_raw_attribute_webids[path] = {
+                        'WebId': attr_info.get('WebId'),
+                        'Id': attr_info.get('Id')
+                    }
+    return all_raw_attribute_webids
                 
-                return all_raw_attribute_webids
 
     # -----------------------------
     # 5. READ DATA (SINGLE STREAM - Example for verification)
@@ -173,7 +334,8 @@ def populate_data(all_raw_attribute_webids, db_engine):
     }
 
     # --- Step 2: Fetch all Time-Series Data ---
-    webids_list = list(all_raw_attribute_webids.values())
+    # Extract list of WebIds for bulk API calls
+    webids_list = [v['WebId'] for v in all_raw_attribute_webids.values()]
     
     # Batch the requests to avoid URL length limit, max 100 WebIds per call
     MAX_BATCH_SIZE = 50 
@@ -197,7 +359,7 @@ def populate_data(all_raw_attribute_webids, db_engine):
             webid = item["WebId"]
             
             # Map WebId back to path to get hierarchy
-            path = next(k for k, v in all_raw_attribute_webids.items() if v == webid)
+            path = next(k for k, v in all_raw_attribute_webids.items() if v['WebId'] == webid)
             parts = path.split('|')
             attr_name = parts[-1]
             unit_name = parts[1]
@@ -419,8 +581,9 @@ def create_schema():
 
 def main():
     all_raw_attribute_webids=setup()
-    conn=create_schema()
-    populate_data(all_raw_attribute_webids, conn)
+    #print(f"Total Raw Attributes Found: {all_raw_attribute_webids}")
+    #conn=create_schema()
+    #populate_data(all_raw_attribute_webids, conn)
     
 
 if __name__ == "__main__":
