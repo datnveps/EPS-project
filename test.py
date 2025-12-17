@@ -12,6 +12,7 @@ import urllib3
 from requests_ntlm import HttpNtlmAuth
 import psycopg2
 import sqlalchemy.types as types
+import re
 
 # PI Web API base URL (shared)
 BASE_URL = "https://10.32.194.4/piwebapi"
@@ -210,6 +211,167 @@ def get_analysis_rule_config(rule_webid):
         return details.get('ConfigString')
     except Exception as e:
         raise RuntimeError(f"Failed to fetch analysis rule {rule_webid}: {e}")
+
+
+def get_analysis_rule_webid(rule_name, scope_webid=None, exact=True, return_all=False, max_results=10):
+    """Return the WebId of analysis rule(s) matching `rule_name`.
+
+    - If `scope_webid` is provided, search analyses under that element (`/elements/{scope_webid}/analyses`).
+    - If not provided, attempt server-side search `/analysisrules?search=` then fallback to listing `/analysisrules`.
+    - `exact` selects exact vs substring matching.
+    - `return_all=True` returns a list of WebIds (up to `max_results`), otherwise returns the first match or None.
+    """
+    items = []
+    try:
+        if scope_webid:
+            resp = get(f"/elements/{scope_webid}/analyses")
+            items = resp.get('Items', [])
+        else:
+            try:
+                resp = get(f"/analysisrules?search={rule_name}")
+                items = resp.get('Items', [])
+            except Exception:
+                resp = get('/analysisrules')
+                items = resp.get('Items', [])
+    except Exception as e:
+        raise RuntimeError(f"Failed to retrieve analysis rules: {e}")
+
+    matches = []
+    for it in items:
+        name = it.get('Name', '')
+        matched = (name == rule_name) if exact else (rule_name in name)
+        if matched:
+            matches.append(it.get('WebId'))
+            if not return_all and len(matches) >= max_results:
+                break
+
+    if return_all:
+        return matches
+    return matches[0] if matches else None
+
+
+# -----------------------------
+# Helpers: element & analysis helpers
+# -----------------------------
+def get_element_webid_by_hierarchy(unit_name, boiler_name, idf_name, 
+                                   asset_server_index=0, database_index=5):
+    """Return the WebId for element path MD1 -> unit_name -> boiler_name -> Induced Draft Fans -> idf_name.
+
+    Uses the same asset server and database selection as `setup()` (by index).
+    """
+    # find asset server
+    asset_servers = get("/assetservers").get("Items", [])
+    if len(asset_servers) <= asset_server_index:
+        raise RuntimeError("Asset server index out of range")
+    asset_server_webid = asset_servers[asset_server_index]["WebId"]
+
+    # find database (use provided index)
+    databases = get(f"/assetservers/{asset_server_webid}/assetdatabases").get("Items", [])
+    if len(databases) <= database_index:
+        raise RuntimeError("Database index out of range")
+    db_item = databases[database_index]
+    db_webid = db_item["WebId"]
+
+    # find root MD1 element (the original code used ?name=MD1 and index 1)
+    root_resp = get(f"/assetdatabases/{db_webid}/elements?name=MD1")
+    items = root_resp.get("Items", [])
+    if not items:
+        raise RuntimeError("MD1 root element not found")
+    # choose the second item if present (keeps behavior from setup())
+    root_el = items[1] if len(items) > 1 else items[0]
+    parent_webid = root_el["WebId"]
+
+    # traverse Unit -> Boiler -> Induced Draft Fans -> IDF
+    # Unit
+    resp = get(f"/elements/{parent_webid}/elements")
+    unit = next((e for e in resp.get("Items", []) if e.get("Name") == unit_name), None)
+    if not unit:
+        raise RuntimeError(f"Unit not found: {unit_name}")
+    parent_webid = unit["WebId"]
+
+    # Boiler
+    resp = get(f"/elements/{parent_webid}/elements")
+    boiler = next((e for e in resp.get("Items", []) if e.get("Name") == boiler_name), None)
+    if not boiler:
+        raise RuntimeError(f"Boiler not found: {boiler_name}")
+    parent_webid = boiler["WebId"]
+
+    # Induced Draft Fans group
+    resp = get(f"/elements/{parent_webid}/elements")
+    idf_group = next((e for e in resp.get("Items", []) if e.get("Name") == "Induced Draft Fans"), None)
+    if not idf_group:
+        raise RuntimeError("Induced Draft Fans group not found under boiler")
+    parent_webid = idf_group["WebId"]
+
+    # IDF-A / IDF-B
+    resp = get(f"/elements/{parent_webid}/elements")
+    idf = next((e for e in resp.get("Items", []) if e.get("Name") == idf_name), None)
+    if not idf:
+        raise RuntimeError(f"IDF element not found: {idf_name}")
+    return idf["WebId"]
+
+
+def find_analysis_in_element(element_webid, analysis_name='Machine_learning', exact=True):
+    """Return analysis dict under element with matching name (or None)."""
+    items = get(f"/elements/{element_webid}/analyses").get('Items', [])
+    for it in items:
+        name = it.get('Name','')
+        matched = (name == analysis_name) if exact else (analysis_name.lower() in name.lower())
+        if matched:
+            return it
+    return None
+
+
+def replace_variable1_in_analysisrule(ar_webid, new_expr, dry_run=True, backup=True):
+    """Replace Variable1 assignment in AnalysisRule's ConfigString and optionally PATCH it.
+
+    Returns the result from `update_analysis_rule_config`.
+    """
+    ar = get(f"/analysisrules/{ar_webid}")
+    cfg = ar.get('ConfigString','')
+
+    # attempt robust replace: find Variable1 := ...; and replace up to Variable2
+    m = re.search(r"(Variable1\s*:=\s*)(.*?);", cfg, flags=re.DOTALL|re.IGNORECASE)
+    if m:
+        start_pos = m.start(1)
+        nxt = re.search(r"\n\s*Variable2\s*:=" , cfg, flags=re.IGNORECASE)
+        if nxt:
+            new_cfg = cfg[:start_pos] + "Variable1 := " + new_expr + ";" + cfg[nxt.start():]
+        else:
+            new_cfg = re.sub(r"(Variable1\s*:=\s*)(.*?);", r"\1" + new_expr + ";", cfg, flags=re.DOTALL|re.IGNORECASE)
+    else:
+        new_cfg = new_expr + ';\n' + cfg
+
+    return update_analysis_rule_config(ar_webid, new_cfg, dry_run=dry_run, backup=backup)
+
+
+def apply_variable1_to_machine_learning(unit='Unit 1', boiler='Boiler A', idf='IDF-A',
+                                        new_expr=None, dry_run=True, backup=True):
+    """High-level: find Machine_learning analysis under chosen element and update Variable1.
+
+    - `new_expr` must be provided (string expression).
+    - `dry_run=True` will only show diff.
+    """
+    if not new_expr:
+        raise ValueError('new_expr is required')
+    element_webid = get_element_webid_by_hierarchy(unit, boiler, idf)
+    analysis = find_analysis_in_element(element_webid, analysis_name='Machine_learning', exact=True)
+    if not analysis:
+        raise RuntimeError('Machine_learning analysis not found under specified element')
+    # get analysis details to find AnalysisRule WebId
+    details = get(f"/analyses/{analysis['WebId']}")
+    ar_webid = None
+    if isinstance(details.get('AnalysisRule'), dict):
+        ar_webid = details['AnalysisRule'].get('WebId')
+    links = details.get('Links') or {}
+    for k,v in links.items():
+        if 'analysisrule' in k.lower() and isinstance(v, str) and '/analysisrules/' in v:
+            ar_webid = v.split('/analysisrules/')[-1]
+            break
+    ar_webid = ar_webid or details.get('AnalysisRuleWebId') or details.get('AnalysisRuleId')
+    if not ar_webid:
+        raise RuntimeError('AnalysisRule WebId not found for Machine_learning')
+    return replace_variable1_in_analysisrule(ar_webid, new_expr, dry_run=dry_run, backup=backup)
 
 # ----------------------------------------------------
 # 2. PI WEB API INTERACTION
@@ -581,7 +743,7 @@ def create_schema():
 
 def main():
     all_raw_attribute_webids=setup()
-    #print(f"Total Raw Attributes Found: {all_raw_attribute_webids}")
+    print(f"Total Raw Attributes Found: {all_raw_attribute_webids}")
     #conn=create_schema()
     #populate_data(all_raw_attribute_webids, conn)
     
